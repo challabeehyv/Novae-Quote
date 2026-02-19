@@ -2,7 +2,9 @@ package com.novae.ocr.dto;
 
 import java.math.BigDecimal;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 
 /**
  * Single quote line in final OCR quote output (maps to QuoteItemDTO).
@@ -15,6 +17,7 @@ public class OcrQuoteLineDTO {
     private String colorParam;
     private BigDecimal basePrice;
     private List<OcrOptionDTO> options = new ArrayList<>();
+    private Map<String, String> specs = new LinkedHashMap<>();
     private Double confidence;
     private List<String> rowFlags = new ArrayList<>();
     private List<ProductSuggestion> suggestions = new ArrayList<>();
@@ -73,6 +76,14 @@ public class OcrQuoteLineDTO {
 
     public void setConfidence(Double confidence) {
         this.confidence = confidence;
+    }
+
+    public Map<String, String> getSpecs() {
+        return specs;
+    }
+
+    public void setSpecs(Map<String, String> specs) {
+        this.specs = specs != null ? specs : new LinkedHashMap<>();
     }
 
     public List<String> getRowFlags() {
