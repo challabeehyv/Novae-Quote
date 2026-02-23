@@ -1,5 +1,7 @@
 package com.novae.ocr.dto;
 
+import com.fasterxml.jackson.annotation.JsonProperty;
+
 /**
  * Option details for a quote line (trailer option: salesCode, name, description, price, etc.).
  * Property names align with MCP client OptionDetail for resolve response JSON deserialization.
@@ -13,6 +15,7 @@ public class OcrOptionDTO {
     private String longDescription;
     private String description;
     private double confidence;
+    private String mrpaltcode;
 
     public String getSalesCode() {
         return salesCode;
@@ -68,5 +71,13 @@ public class OcrOptionDTO {
 
     public void setConfidence(double confidence) {
         this.confidence = confidence;
+    }
+
+    public String getMrpaltcode() {
+        return mrpaltcode;
+    }
+
+    public void setMrpaltcode(String mrpaltcode) {
+        this.mrpaltcode = mrpaltcode;
     }
 }

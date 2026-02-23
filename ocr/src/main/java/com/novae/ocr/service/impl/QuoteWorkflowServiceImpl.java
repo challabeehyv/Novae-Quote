@@ -159,6 +159,7 @@ public class QuoteWorkflowServiceImpl implements QuoteWorkflowService {
         Map<String, OcrOptionDTO> optionByDescription = new LinkedHashMap<>();
         Map<String, String> specs = new LinkedHashMap<>();
 
+        // 1️⃣ Load resolved options first
         if (res != null && res.getOptionDetails() != null) {
             for (OcrOptionDTO detail : res.getOptionDetails()) {
                 if (detail == null) continue;
@@ -177,11 +178,11 @@ public class QuoteWorkflowServiceImpl implements QuoteWorkflowService {
                 }
                 if (looksLikePrimaryDescription(text)) continue;
                 if (isAccessoryOption(text)) {
-                    optionByDescription.put(normalize(text), cleaned);
+                    optionByDescription.putIfAbsent(normalize(text), cleaned);
                 }
             }
         }
-
+        // 2️⃣ Merge raw OCR options into same DTOs
         List<String> raw = mergeRawOptions(res, ext);
         for (String rawOption : raw) {
             if (isBlank(rawOption)) continue;
@@ -194,19 +195,24 @@ public class QuoteWorkflowServiceImpl implements QuoteWorkflowService {
             if (looksLikePrimaryDescription(text)) continue;
             if (isAccessoryOption(text)) {
                 String key = normalize(text);
-                if (!optionByDescription.containsKey(key)) {
-                    OcrOptionDTO dto = new OcrOptionDTO();
-                    if (looksLikeSalesCode(text)) {
-                        dto.setSalesCode(text);
-                        optionByDescription.put("sc:" + key, dto);
+
+                OcrOptionDTO dto = optionByDescription.get(key);
+
+                if (dto == null) {
+                    dto = new OcrOptionDTO();
+                    optionByDescription.put(key, dto);
+                }
+
+                if (looksLikeSalesCode(text)) {
+                    dto.setSalesCode(text);
+                } else {
+                    OcrOptionDTO primary = findBestPrimaryOption(optionByDescription, text);
+                    if (primary != null) {
+                        primary.setLongDescription(
+                                appendLongDescription(primary.getLongDescription(), text)
+                        );
                     } else {
-                        OcrOptionDTO primary = findBestPrimaryOption(optionByDescription, text);
-                        if (primary != null) {
-                            primary.setLongDescription(appendLongDescription(primary.getLongDescription(), text));
-                        } else {
-                            dto.setDescription(text);
-                            optionByDescription.put(key, dto);
-                        }
+                        dto.setDescription(text);
                     }
                 }
             }
@@ -214,7 +220,6 @@ public class QuoteWorkflowServiceImpl implements QuoteWorkflowService {
 
         return new LineDetails(new ArrayList<>(optionByDescription.values()), specs);
     }
-
     private static List<String> mergeRawOptions(ResolvedLine res, ExtractedLine ext) {
         LinkedHashSet<String> merged = new LinkedHashSet<>();
         if (res != null && res.getNormalizedOptions() != null) {
@@ -332,6 +337,7 @@ public class QuoteWorkflowServiceImpl implements QuoteWorkflowService {
         OcrOptionDTO out = new OcrOptionDTO();
         out.setConfidence(source.getConfidence());
         out.setSalesCode(source.getSalesCode());
+        out.setMrpaltcode(trimToNull(source.getMrpaltcode()));
 
         String salesCode = trimToNull(source.getSalesCode());
         String description = trimToNull(source.getDescription());
@@ -393,7 +399,7 @@ public class QuoteWorkflowServiceImpl implements QuoteWorkflowService {
                 best = existing;
             }
         }
-        return bestScore >= 0.66 ? best : null;
+        return bestScore >= 0.9 ? best : null;
     }
 
     private static double similarityScore(String left, String right) {
