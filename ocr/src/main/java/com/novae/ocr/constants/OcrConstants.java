@@ -35,6 +35,7 @@ public final class OcrConstants {
 
     // Error messages
     public static final String ERROR_OCR_FAILED = "Azure OCR processing failed";
+    public static final String ERROR_OCR_DNS_FAILED = "Azure OCR endpoint DNS resolution failed";
     public static final String ERROR_EXTRACTION_FAILED = "LLM extraction failed";
     public static final String ERROR_RESOLUTION_FAILED = "Resolution agent failed";
     public static final String ERROR_VALIDATION_FAILED = "Validation failed";

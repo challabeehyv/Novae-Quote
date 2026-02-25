@@ -6,19 +6,28 @@ import com.novae.ocr.dto.ExtractedQuote;
 import com.novae.ocr.dto.OcrOptionDTO;
 import com.novae.ocr.dto.OcrQuoteDTO;
 import com.novae.ocr.dto.OcrQuoteLineDTO;
+import com.novae.ocr.dto.ProductSuggestion;
 import com.novae.ocr.dto.ResolvedLine;
 import com.novae.ocr.dto.ResolutionResult;
 import com.novae.ocr.dto.ValidationResult;
+import com.novae.ocr.exception.OcrProcessingException;
 import com.novae.ocr.service.AzureOcrService;
 import com.novae.ocr.service.QuoteWorkflowService;
 import com.novae.ocr.service.ValidationService;
+import jakarta.annotation.PreDestroy;
+import org.springframework.beans.factory.annotation.Value;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.stereotype.Service;
 import org.springframework.web.context.request.RequestContextHolder;
 import org.springframework.web.context.request.ServletRequestAttributes;
 import org.springframework.web.client.RestClient;
+import org.springframework.web.client.RestClientException;
 import org.springframework.web.multipart.MultipartFile;
+import org.springframework.http.MediaType;
 
+import java.io.ByteArrayInputStream;
 import java.util.ArrayList;
 import java.util.Collections;
 
@@ -27,72 +36,94 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Semaphore;
 import java.util.regex.Pattern;
 import java.util.regex.Matcher;
 
 @Service
 public class QuoteWorkflowServiceImpl implements QuoteWorkflowService {
-    private static final Pattern SIZE_PATTERN = Pattern.compile("\\b\\d+\\s*[xX]\\s*\\d+\\b");
+    private static final Logger log = LoggerFactory.getLogger(QuoteWorkflowServiceImpl.class);
+    private static final Pattern SIZE_PATTERN = Pattern.compile(
+            "\\b\\d+\\s*[xX]\\s*\\d+(?:\\s*\\(\\s*\\d+\\s*\\+\\s*\\d+\\s*\\))?\\b");
     private static final Pattern SALES_CODE_PATTERN = Pattern.compile("^[A-Za-z0-9][A-Za-z0-9-]{2,}$");
 
     private final AzureOcrService azureOcrService;
     private final ValidationService validationService;
     private final RestClient mcpClientRestClient;
+    private final int resolveMaxLinesPerBatch;
+    private final int resolveParallelism;
+    private final Semaphore resolveRequestLimiter;
+    private final ExecutorService resolveExecutor;
 
     public QuoteWorkflowServiceImpl(
             AzureOcrService azureOcrService,
             ValidationService validationService,
-            @Qualifier("mcpClientRestClient") RestClient mcpClientRestClient) {
+            @Qualifier("mcpClientRestClient") RestClient mcpClientRestClient,
+            @Value("${ocr.resolve.max-lines-per-batch:8}") int resolveMaxLinesPerBatch,
+            @Value("${ocr.resolve.parallelism:2}") int resolveParallelism,
+            @Value("${ocr.resolve.max-inflight-requests:1}") int resolveMaxInflightRequests) {
         this.azureOcrService = azureOcrService;
         this.validationService = validationService;
         this.mcpClientRestClient = mcpClientRestClient;
+        this.resolveMaxLinesPerBatch = Math.max(1, resolveMaxLinesPerBatch);
+        this.resolveParallelism = Math.max(1, resolveParallelism);
+        this.resolveRequestLimiter = new Semaphore(Math.max(1, resolveMaxInflightRequests), true);
+        this.resolveExecutor = Executors.newFixedThreadPool(this.resolveParallelism);
+    }
+
+    @PreDestroy
+    void shutdownResolveExecutor() {
+        resolveExecutor.shutdown();
     }
 
     @Override
     public OcrQuoteDTO processPdf(MultipartFile file) {
         String ocrText = azureOcrService.extractText(file);
-        return processOcrText(ocrText);
+        return processOcrText(ocrText, currentAuthorizationHeader());
+    }
+
+    @Override
+    public OcrQuoteDTO processPdf(MultipartFile file, String authorizationHeader) {
+        String ocrText = azureOcrService.extractText(file);
+        return processOcrText(ocrText, authorizationHeader);
+    }
+
+    @Override
+    public OcrQuoteDTO processPdfBytes(byte[] fileBytes, String fileName, String authorizationHeader) {
+        if (fileBytes == null || fileBytes.length == 0) {
+            throw new OcrProcessingException(OcrConstants.ERROR_OCR_FAILED);
+        }
+        try (ByteArrayInputStream in = new ByteArrayInputStream(fileBytes)) {
+            String ocrText = azureOcrService.extractText(in, fileName);
+            return processOcrText(ocrText, authorizationHeader);
+        } catch (Exception e) {
+            throw new OcrProcessingException(OcrConstants.ERROR_OCR_FAILED, e);
+        }
     }
 
     @Override
     public OcrQuoteDTO processPdfByPath(String filePath) {
         try (var is = java.nio.file.Files.newInputStream(java.nio.file.Paths.get(filePath))) {
             String ocrText = azureOcrService.extractText(is, filePath);
-            return processOcrText(ocrText);
+            return processOcrText(ocrText, currentAuthorizationHeader());
         } catch (Exception e) {
             throw new com.novae.ocr.exception.OcrProcessingException(
                     OcrConstants.ERROR_OCR_FAILED, e);
         }
     }
 
-    private OcrQuoteDTO processOcrText(String ocrText) {
-        String authorization = currentAuthorizationHeader();
-
-        var extractRequest = mcpClientRestClient.post()
-                .uri(OcrConstants.MCP_CLIENT_EXTRACT)
-                .contentType(org.springframework.http.MediaType.TEXT_PLAIN);
-        if (authorization != null && !authorization.isBlank()) {
-            extractRequest = extractRequest.header("Authorization", authorization);
-        }
-        ExtractedQuote extracted = extractRequest
-                .body(ocrText)
-                .retrieve()
-                .body(ExtractedQuote.class);
+    private OcrQuoteDTO processOcrText(String ocrText, String authorizationHeader) {
+        ExtractedQuote extracted = extractQuote(ocrText, authorizationHeader);
 
         if (extracted == null) {
             extracted = new ExtractedQuote();
         }
 
-        var resolveRequest = mcpClientRestClient.post()
-                .uri(OcrConstants.MCP_CLIENT_RESOLVE)
-                .contentType(org.springframework.http.MediaType.APPLICATION_JSON);
-        if (authorization != null && !authorization.isBlank()) {
-            resolveRequest = resolveRequest.header("Authorization", authorization);
-        }
-        ResolutionResult resolved = resolveRequest
-                .body(extracted)
-                .retrieve()
-                .body(ResolutionResult.class);
+        ResolutionResult resolved = resolveQuote(extracted, authorizationHeader);
 
         if (resolved == null) {
             resolved = new ResolutionResult();
@@ -122,37 +153,270 @@ public class QuoteWorkflowServiceImpl implements QuoteWorkflowService {
         return dto;
     }
 
-    private static List<OcrQuoteLineDTO> mapQuoteItems(ExtractedQuote extracted, ResolutionResult resolved) {
-        List<OcrQuoteLineDTO> items = new ArrayList<>();
+    private ExtractedQuote extractQuote(String ocrText, String authorization) {
+        try {
+            var extractRequest = mcpClientRestClient.post()
+                    .uri(OcrConstants.MCP_CLIENT_EXTRACT)
+                    .contentType(MediaType.TEXT_PLAIN)
+                    .accept(MediaType.APPLICATION_JSON);
+            if (authorization != null && !authorization.isBlank()) {
+                extractRequest = extractRequest.header("Authorization", authorization);
+            }
+            return extractRequest
+                    .body(ocrText)
+                    .retrieve()
+                    .body(ExtractedQuote.class);
+        } catch (RestClientException e) {
+            throw toMcpException(OcrConstants.ERROR_EXTRACTION_FAILED, OcrConstants.MCP_CLIENT_EXTRACT, e);
+        }
+    }
+
+    private ResolutionResult resolveQuote(ExtractedQuote extracted, String authorization) {
+        long startNs = System.nanoTime();
+        ResolutionResult result = resolveQuoteWithRetry(extracted, authorization);
+        long elapsedMs = (System.nanoTime() - startNs) / 1_000_000;
+        int lineCount = extracted != null && extracted.getLines() != null ? extracted.getLines().size() : 0;
+        log.info("Resolve completed in {} ms for {} lines (single-request mode)", elapsedMs, lineCount);
+        return result;
+    }
+
+    private List<ResolutionResult> resolveWave(List<ExtractedQuote> wave, String authorization, int startBatchIndex) {
+        List<CompletableFuture<ResolutionResult>> futures = new ArrayList<>();
+        for (int i = 0; i < wave.size(); i++) {
+            ExtractedQuote batch = wave.get(i);
+            final int batchIndex = startBatchIndex + i + 1;
+            futures.add(CompletableFuture.supplyAsync(
+                    () -> resolveBatchWithTiming(batch, authorization, batchIndex), resolveExecutor));
+        }
+        try {
+            CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).join();
+        } catch (CompletionException e) {
+            Throwable cause = e.getCause();
+            if (cause instanceof RuntimeException runtimeException) {
+                throw runtimeException;
+            }
+            throw new OcrProcessingException(OcrConstants.ERROR_RESOLUTION_FAILED, e);
+        }
+        return futures.stream().map(CompletableFuture::join).toList();
+    }
+
+    private ResolutionResult resolveBatchWithTiming(ExtractedQuote batch, String authorization, int batchIndex) {
+        int lineCount = batch.getLines() != null ? batch.getLines().size() : 0;
+        long startNs = System.nanoTime();
+        log.info("Resolve batch {} started (lines={})", batchIndex, lineCount);
+        try {
+            ResolutionResult result = resolveQuoteWithoutRetry(batch, authorization);
+            long elapsedMs = (System.nanoTime() - startNs) / 1_000_000;
+            log.info("Resolve batch {} succeeded in {} ms", batchIndex, elapsedMs);
+            return result;
+        } catch (RuntimeException ex) {
+            long elapsedMs = (System.nanoTime() - startNs) / 1_000_000;
+            log.warn("Resolve batch {} failed after {} ms", batchIndex, elapsedMs, ex);
+            throw ex;
+        }
+    }
+
+    private ResolutionResult resolveBatchesSequentially(List<ExtractedQuote> batches, String authorization) {
+        List<ResolutionResult> partials = new ArrayList<>();
+        for (ExtractedQuote batch : batches) {
+            partials.add(resolveQuoteWithRetry(batch, authorization));
+        }
+        return mergeResolutionResults(partials, batches.stream()
+                .map(ExtractedQuote::getLines)
+                .filter(java.util.Objects::nonNull)
+                .mapToInt(List::size)
+                .sum());
+    }
+
+    private ResolutionResult resolveQuoteWithRetry(ExtractedQuote extracted, String authorization) {
+        try {
+            return executeResolveQuote(extracted, authorization);
+        } catch (RestClientException first) {
+            if (isReadTimeout(first)) {
+                log.warn("MCP resolve timed out, retrying once endpoint={}", OcrConstants.MCP_CLIENT_RESOLVE);
+                try {
+                    return executeResolveQuote(extracted, authorization);
+                } catch (RestClientException second) {
+                    throw toMcpException(OcrConstants.ERROR_RESOLUTION_FAILED, OcrConstants.MCP_CLIENT_RESOLVE, second);
+                }
+            }
+            throw toMcpException(OcrConstants.ERROR_RESOLUTION_FAILED, OcrConstants.MCP_CLIENT_RESOLVE, first);
+        }
+    }
+
+    private ResolutionResult resolveQuoteWithoutRetry(ExtractedQuote extracted, String authorization) {
+        try {
+            return executeResolveQuote(extracted, authorization);
+        } catch (RestClientException exception) {
+            throw toMcpException(OcrConstants.ERROR_RESOLUTION_FAILED, OcrConstants.MCP_CLIENT_RESOLVE, exception);
+        }
+    }
+
+    private static List<ExtractedQuote> partitionExtractedQuote(ExtractedQuote extracted, int batchSize) {
+        List<ExtractedLine> lines = extracted.getLines() != null ? extracted.getLines() : Collections.emptyList();
+        List<ExtractedQuote> batches = new ArrayList<>();
+        for (int i = 0; i < lines.size(); i += batchSize) {
+            int end = Math.min(lines.size(), i + batchSize);
+            ExtractedQuote batch = new ExtractedQuote();
+            batch.setPoNumber(extracted.getPoNumber());
+            batch.setVendorName(extracted.getVendorName());
+            batch.setSubtotal(extracted.getSubtotal());
+            batch.setTax(extracted.getTax());
+            batch.setTotal(extracted.getTotal());
+            batch.setDocumentType(extracted.getDocumentType());
+            batch.setLines(new ArrayList<>(lines.subList(i, end)));
+            batches.add(batch);
+        }
+        return batches;
+    }
+
+    private static ResolutionResult mergeResolutionResults(List<ResolutionResult> partials, int totalLines) {
+        ResolutionResult merged = new ResolutionResult();
+        List<ResolvedLine> mergedLines = new ArrayList<>();
+        List<String> warnings = new ArrayList<>();
+        List<String> missingFields = new ArrayList<>();
+        String vendorId = null;
+        double confidenceTotal = 0.0;
+        int confidenceWeight = 0;
+
+        for (ResolutionResult partial : partials) {
+            if (partial == null) {
+                continue;
+            }
+            List<ResolvedLine> lines = partial.getLines() != null ? partial.getLines() : Collections.emptyList();
+            mergedLines.addAll(lines);
+            int weight = lines.size();
+            confidenceTotal += partial.getOverallConfidence() * weight;
+            confidenceWeight += weight;
+            if (vendorId == null && partial.getResolvedVendorId() != null && !partial.getResolvedVendorId().isBlank()) {
+                vendorId = partial.getResolvedVendorId();
+            }
+            if (partial.getWarnings() != null) {
+                for (String warning : partial.getWarnings()) {
+                    if (warning != null && !warnings.contains(warning)) {
+                        warnings.add(warning);
+                    }
+                }
+            }
+            if (partial.getMissingFields() != null) {
+                for (String field : partial.getMissingFields()) {
+                    if (field != null && !missingFields.contains(field)) {
+                        missingFields.add(field);
+                    }
+                }
+            }
+        }
+
+        merged.setLines(mergedLines);
+        merged.setResolvedVendorId(vendorId);
+        if (confidenceWeight > 0) {
+            merged.setOverallConfidence(confidenceTotal / confidenceWeight);
+        } else if (totalLines > 0) {
+            merged.setOverallConfidence(confidenceTotal / totalLines);
+        } else {
+            merged.setOverallConfidence(0.0);
+        }
+        merged.setWarnings(warnings);
+        merged.setMissingFields(missingFields);
+        return merged;
+    }
+
+    private ResolutionResult executeResolveQuote(ExtractedQuote extracted, String authorization) {
+        long waitStartNs = System.nanoTime();
+        try {
+            resolveRequestLimiter.acquire();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new OcrProcessingException(OcrConstants.ERROR_RESOLUTION_FAILED, e);
+        }
+        long waitedMs = (System.nanoTime() - waitStartNs) / 1_000_000;
+        if (waitedMs > 0) {
+            log.info("Resolve request waited {} ms for inflight slot", waitedMs);
+        }
+        try {
+            var resolveRequest = mcpClientRestClient.post()
+                    .uri(OcrConstants.MCP_CLIENT_RESOLVE)
+                    .contentType(MediaType.APPLICATION_JSON)
+                    .accept(MediaType.APPLICATION_JSON);
+            if (authorization != null && !authorization.isBlank()) {
+                resolveRequest = resolveRequest.header("Authorization", authorization);
+            }
+            return resolveRequest
+                    .body(extracted)
+                    .retrieve()
+                    .body(ResolutionResult.class);
+        } finally {
+            resolveRequestLimiter.release();
+        }
+    }
+
+    private OcrProcessingException toMcpException(String message, String endpoint, RestClientException exception) {
+        String suffix = "";
+        if (isReadTimeout(exception)) {
+            suffix = " (downstream read timeout)";
+        }
+        log.warn("MCP call failed endpoint={} message={}", endpoint, exception.getMessage(), exception);
+        return new OcrProcessingException(message + suffix, exception);
+    }
+
+    private static boolean isReadTimeout(Exception exception) {
+        Throwable cause = exception;
+        while (cause != null) {
+            if (cause instanceof java.net.SocketTimeoutException) {
+                return true;
+            }
+            cause = cause.getCause();
+        }
+        return false;
+    }
+
+    private List<OcrQuoteLineDTO> mapQuoteItems(ExtractedQuote extracted, ResolutionResult resolved) {
         List<ExtractedLine> extLines = extracted.getLines() != null ? extracted.getLines() : Collections.emptyList();
         List<ResolvedLine> resLines = resolved.getLines() != null ? resolved.getLines() : Collections.emptyList();
+        if (extLines.isEmpty()) {
+            return List.of();
+        }
+        List<CompletableFuture<OcrQuoteLineDTO>> futures = new ArrayList<>(extLines.size());
         for (int i = 0; i < extLines.size(); i++) {
-            ExtractedLine ext = extLines.get(i);
-            ResolvedLine res = i < resLines.size() ? resLines.get(i) : null;
-            String canonicalName = res != null ? res.getCanonicalName() : null;
-            String setDesc = (canonicalName != null && !canonicalName.isBlank()) ? canonicalName : effectiveDescription(ext);
-            OcrQuoteLineDTO line = new OcrQuoteLineDTO();
-            line.setModelId(res != null ? res.getSku() : null);
-            line.setDescription(setDesc);
-            line.setQty(ext.getQty());
-            line.setColorParam(res != null ? res.getNormalizedColor() : ext.getColor());
-            line.setBasePrice(ext.getUnitPrice());
-            LineDetails details = resolveLineDetails(res, ext);
-            line.setOptions(details.options());
-            line.setSpecs(details.specs());
-            line.setConfidence(resolveLineConfidence(ext, res));
-            List<String> rowFlags = new ArrayList<>();
-            if (res != null && res.getRowFlags() != null) rowFlags.addAll(res.getRowFlags());
-            if (res == null || res.getSku() == null || res.getSku().isBlank()) rowFlags.add(OcrConstants.ROW_FLAG_UNRESOLVED_PRODUCT);
-            if (ext.getQty() == null) rowFlags.add(OcrConstants.ROW_FLAG_MISSING_QTY);
-            if (ext.getUnitPrice() == null) rowFlags.add(OcrConstants.ROW_FLAG_MISSING_PRICE);
-            line.setRowFlags(rowFlags);
-            if (res != null && res.getSuggestions() != null && !res.getSuggestions().isEmpty()) {
-                line.setSuggestions(new ArrayList<>(res.getSuggestions()));
-            }
-            items.add(line);
+            final int lineIndex = i;
+            futures.add(CompletableFuture.supplyAsync(
+                    () -> mapQuoteItem(extLines, resLines, lineIndex),
+                    resolveExecutor));
+        }
+        List<OcrQuoteLineDTO> items = new ArrayList<>(extLines.size());
+        for (CompletableFuture<OcrQuoteLineDTO> future : futures) {
+            items.add(future.join());
         }
         return items;
+    }
+
+    private static OcrQuoteLineDTO mapQuoteItem(List<ExtractedLine> extLines, List<ResolvedLine> resLines, int index) {
+        ExtractedLine ext = extLines.get(index);
+        ResolvedLine res = index < resLines.size() ? resLines.get(index) : null;
+        String canonicalName = res != null ? res.getCanonicalName() : null;
+        String ocrDescription = effectiveDescription(ext);
+        String setDesc = (ocrDescription != null && !ocrDescription.isBlank()) ? ocrDescription : canonicalName;
+        String resolvedModelId = resolveModelId(res);
+        OcrQuoteLineDTO line = new OcrQuoteLineDTO();
+        line.setModelId(resolvedModelId);
+        line.setDescription(setDesc);
+        line.setQty(ext.getQty());
+        line.setColorParam(res != null ? res.getNormalizedColor() : ext.getColor());
+        line.setBasePrice(ext.getUnitPrice());
+        LineDetails details = resolveLineDetails(res, ext);
+        line.setOptions(details.options());
+        line.setSpecs(details.specs());
+        line.setConfidence(resolveLineConfidence(ext, res));
+        List<String> rowFlags = new ArrayList<>();
+        if (res != null && res.getRowFlags() != null) rowFlags.addAll(res.getRowFlags());
+        if (resolvedModelId == null || resolvedModelId.isBlank()) rowFlags.add(OcrConstants.ROW_FLAG_UNRESOLVED_PRODUCT);
+        if (ext.getQty() == null) rowFlags.add(OcrConstants.ROW_FLAG_MISSING_QTY);
+        if (ext.getUnitPrice() == null) rowFlags.add(OcrConstants.ROW_FLAG_MISSING_PRICE);
+        line.setRowFlags(rowFlags);
+        if (res != null && res.getSuggestions() != null && !res.getSuggestions().isEmpty()) {
+            line.setSuggestions(new ArrayList<>(res.getSuggestions()));
+        }
+        return line;
     }
 
     private static LineDetails resolveLineDetails(ResolvedLine res, ExtractedLine ext) {
@@ -189,26 +453,6 @@ public class QuoteWorkflowServiceImpl implements QuoteWorkflowService {
             SpecEntry spec = extractSpec(text);
             if (spec != null) {
                 specs.putIfAbsent(spec.key(), spec.value());
-                continue;
-            }
-            if (looksLikePrimaryDescription(text)) continue;
-            if (isAccessoryOption(text)) {
-                String key = normalize(text);
-                if (!optionByDescription.containsKey(key)) {
-                    OcrOptionDTO dto = new OcrOptionDTO();
-                    if (looksLikeSalesCode(text)) {
-                        dto.setSalesCode(text);
-                        optionByDescription.put("sc:" + key, dto);
-                    } else {
-                        OcrOptionDTO primary = findBestPrimaryOption(optionByDescription, text);
-                        if (primary != null) {
-                            primary.setLongDescription(appendLongDescription(primary.getLongDescription(), text));
-                        } else {
-                            dto.setDescription(text);
-                            optionByDescription.put(key, dto);
-                        }
-                    }
-                }
             }
         }
 
@@ -230,18 +474,52 @@ public class QuoteWorkflowServiceImpl implements QuoteWorkflowService {
         return new ArrayList<>(merged);
     }
 
+    private static String resolveModelId(ResolvedLine res) {
+        if (res == null) {
+            return null;
+        }
+        String sku = trimToNull(res.getSku());
+        if (sku != null) {
+            return sku;
+        }
+        List<ProductSuggestion> suggestions = res.getSuggestions();
+        if (suggestions == null || suggestions.isEmpty()) {
+            return null;
+        }
+        for (ProductSuggestion suggestion : suggestions) {
+            if (suggestion == null) continue;
+            String suggestionSku = trimToNull(suggestion.getSku());
+            if (suggestionSku != null) {
+                return suggestionSku;
+            }
+        }
+        ProductSuggestion first = suggestions.get(0);
+        if (first == null) {
+            return null;
+        }
+        String firstModelId = trimToNull(first.getModelId());
+        if (firstModelId != null) {
+            return firstModelId;
+        }
+        String firstSku = trimToNull(first.getSku());
+        if (firstSku != null) {
+            return firstSku;
+        }
+        return trimToNull(first.getName());
+    }
+
     /**
-     * Description for display/lookup: description field, else model, else first option if it looks like a product line (LLM sometimes puts Description column in options).
+     * Description for display/lookup: OCR description first, then product-like option fallback, then model.
      */
     private static String effectiveDescription(ExtractedLine ext) {
         if (ext.getDescription() != null && !ext.getDescription().isBlank()) return ext.getDescription();
-        if (ext.getModel() != null && !ext.getModel().isBlank()) return ext.getModel();
         if (ext.getOptions() != null && !ext.getOptions().isEmpty()) {
             String first = ext.getOptions().get(0);
             if (first != null && first.length() > 15 && !first.startsWith("Body:") && !first.startsWith("Construction:") && !first.startsWith("Gate:") && !first.startsWith("Floor") && !first.startsWith("Hitch:") && !first.startsWith("Axles:") && !first.startsWith("Color:") && !first.startsWith("Empty Weight") && !first.startsWith("GVW:") && !first.startsWith("Length:") && !first.startsWith("Width:") && !first.startsWith("Height")) {
                 return first;
             }
         }
+        if (ext.getModel() != null && !ext.getModel().isBlank()) return ext.getModel();
         return null;
     }
 
@@ -332,6 +610,7 @@ public class QuoteWorkflowServiceImpl implements QuoteWorkflowService {
         OcrOptionDTO out = new OcrOptionDTO();
         out.setConfidence(source.getConfidence());
         out.setSalesCode(source.getSalesCode());
+        out.setStandard(source.getStandard());
 
         String salesCode = trimToNull(source.getSalesCode());
         String description = trimToNull(source.getDescription());
@@ -377,84 +656,6 @@ public class QuoteWorkflowServiceImpl implements QuoteWorkflowService {
             if (Character.isDigit(s.charAt(i))) return true;
         }
         return false;
-    }
-
-    private static OcrOptionDTO findBestPrimaryOption(Map<String, OcrOptionDTO> options, String candidate) {
-        if (isBlank(candidate) || options == null || options.isEmpty()) return null;
-        double bestScore = 0.0;
-        OcrOptionDTO best = null;
-        for (OcrOptionDTO existing : options.values()) {
-            if (existing == null) continue;
-            if (!isBlank(existing.getSalesCode())) continue;
-            if (isBlank(existing.getDescription())) continue;
-            double score = similarityScore(existing.getDescription(), candidate);
-            if (score > bestScore) {
-                bestScore = score;
-                best = existing;
-            }
-        }
-        return bestScore >= 0.66 ? best : null;
-    }
-
-    private static double similarityScore(String left, String right) {
-        if (isBlank(left) || isBlank(right)) return 0.0;
-        String l = canonicalOptionText(left);
-        String r = canonicalOptionText(right);
-        if (l.equals(r)) return 1.0;
-        if (l.contains(r) || r.contains(l)) return 0.9;
-
-        List<String> lt = tokens(l);
-        List<String> rt = tokens(r);
-        if (lt.isEmpty() || rt.isEmpty()) return 0.0;
-        int overlap = 0;
-        for (String token : lt) {
-            if (rt.contains(token)) overlap++;
-        }
-        return (double) overlap / Math.min(lt.size(), rt.size());
-    }
-
-    private static String canonicalOptionText(String value) {
-        if (isBlank(value)) return "";
-        String collapsed = collapseWhitespace(value.toUpperCase(Locale.ROOT)
-                .replace(".", " ")
-                .replace(",", " "));
-        List<String> tokens = tokens(collapsed);
-        if (tokens.size() % 2 == 0) {
-            int half = tokens.size() / 2;
-            boolean repeated = true;
-            for (int i = 0; i < half; i++) {
-                if (!tokens.get(i).equals(tokens.get(i + half))) {
-                    repeated = false;
-                    break;
-                }
-            }
-            if (repeated) {
-                return String.join(" ", tokens.subList(0, half));
-            }
-        }
-        return String.join(" ", tokens);
-    }
-
-    private static List<String> tokens(String value) {
-        if (isBlank(value)) return List.of();
-        String[] raw = value.split("\\s+");
-        List<String> out = new ArrayList<>();
-        for (String token : raw) {
-            String cleaned = normalizeToken(token);
-            if (!cleaned.isEmpty()) out.add(cleaned);
-        }
-        return out;
-    }
-
-    private static String appendLongDescription(String current, String extra) {
-        String normalizedCurrent = trimToNull(current);
-        String normalizedExtra = trimToNull(extra);
-        if (normalizedExtra == null) return normalizedCurrent;
-        if (normalizedCurrent == null) return normalizedExtra;
-        if (canonicalOptionText(normalizedCurrent).equals(canonicalOptionText(normalizedExtra))) {
-            return normalizedCurrent;
-        }
-        return normalizedCurrent + ", " + normalizedExtra;
     }
 
     private static String normalizeToken(String token) {

@@ -5,6 +5,7 @@ package com.novae.ocr.dto;
  */
 public class ProductSuggestion {
 
+    private String modelId;
     private String sku;
     private String name;
     private double confidence;
@@ -15,6 +16,14 @@ public class ProductSuggestion {
         this.sku = sku;
         this.name = name;
         this.confidence = confidence;
+    }
+
+    public String getModelId() {
+        return modelId;
+    }
+
+    public void setModelId(String modelId) {
+        this.modelId = modelId;
     }
 
     public String getSku() {

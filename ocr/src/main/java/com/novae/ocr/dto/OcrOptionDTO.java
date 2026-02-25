@@ -12,6 +12,7 @@ public class OcrOptionDTO {
     private String price;
     private String longDescription;
     private String description;
+    private Boolean standard;
     private double confidence;
 
     public String getSalesCode() {
@@ -60,6 +61,14 @@ public class OcrOptionDTO {
 
     public void setDescription(String description) {
         this.description = description;
+    }
+
+    public Boolean getStandard() {
+        return standard;
+    }
+
+    public void setStandard(Boolean standard) {
+        this.standard = standard;
     }
 
     public double getConfidence() {

@@ -54,6 +54,9 @@ public class AzureOcrServiceImpl implements AzureOcrService {
             return doExtract(inputStream, fileName);
         } catch (Exception e) {
             log.warn("Azure OCR failed for file={}", fileName, e);
+            if (isUnknownHost(e)) {
+                throw new OcrProcessingException(OcrConstants.ERROR_OCR_DNS_FAILED, e);
+            }
             throw new OcrProcessingException(OcrConstants.ERROR_OCR_FAILED, e);
         }
     }
@@ -67,6 +70,9 @@ public class AzureOcrServiceImpl implements AzureOcrService {
             return doExtractByPages(inputStream, fileName);
         } catch (Exception e) {
             log.warn("Azure OCR by-pages failed for file={}", fileName, e);
+            if (isUnknownHost(e)) {
+                throw new OcrProcessingException(OcrConstants.ERROR_OCR_DNS_FAILED, e);
+            }
             throw new OcrProcessingException(OcrConstants.ERROR_OCR_FAILED, e);
         }
     }
@@ -118,5 +124,16 @@ public class AzureOcrServiceImpl implements AzureOcrService {
             out.write(buf, 0, n);
         }
         return out.toByteArray();
+    }
+
+    private static boolean isUnknownHost(Throwable throwable) {
+        Throwable cause = throwable;
+        while (cause != null) {
+            if (cause instanceof java.net.UnknownHostException) {
+                return true;
+            }
+            cause = cause.getCause();
+        }
+        return false;
     }
 }

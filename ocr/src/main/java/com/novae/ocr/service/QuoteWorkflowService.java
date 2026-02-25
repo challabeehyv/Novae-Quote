@@ -14,6 +14,16 @@ public interface QuoteWorkflowService {
     OcrQuoteDTO processPdf(MultipartFile file);
 
     /**
+     * Process uploaded PDF through full pipeline using explicit auth header.
+     */
+    OcrQuoteDTO processPdf(MultipartFile file, String authorizationHeader);
+
+    /**
+     * Process PDF bytes through full pipeline using explicit auth header.
+     */
+    OcrQuoteDTO processPdfBytes(byte[] fileBytes, String fileName, String authorizationHeader);
+
+    /**
      * Process PDF from file path (e.g. for testing or batch).
      */
     OcrQuoteDTO processPdfByPath(String filePath);
