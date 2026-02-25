@@ -27,7 +27,7 @@ import java.util.concurrent.Executors;
  * REST API for PDF-to-Quote pipeline.
  */
 @RestController
-@RequestMapping("/api/ocr/")
+@RequestMapping("/api/ocr")
 public class QuoteController {
 
     private enum JobStatus {
@@ -64,19 +64,19 @@ public class QuoteController {
         asyncExecutor.shutdown();
     }
 
-    @PostMapping(value = "/upload", consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
+    @PostMapping(value = "upload", consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
     public ResponseEntity<OcrQuoteDTO> uploadAndProcess(@RequestParam("file") MultipartFile file) {
         OcrQuoteDTO result = quoteWorkflowService.processPdf(file);
         return ResponseEntity.ok(result);
     }
 
-    @PostMapping("/process")
+    @PostMapping("process")
     public ResponseEntity<OcrQuoteDTO> processByPath(@RequestParam("path") String filePath) {
         OcrQuoteDTO result = quoteWorkflowService.processPdfByPath(filePath);
         return ResponseEntity.ok(result);
     }
 
-    @PostMapping(value = "/upload/async", consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
+    @PostMapping(value = "upload/async", consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
     public ResponseEntity<Map<String, String>> uploadAndProcessAsync(
             @RequestParam("file") MultipartFile file,
             @RequestHeader(value = "Authorization", required = false) String authorizationHeader) {
