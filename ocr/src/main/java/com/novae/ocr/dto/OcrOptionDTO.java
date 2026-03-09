@@ -12,6 +12,7 @@ public class OcrOptionDTO {
     private String price;
     private String longDescription;
     private String description;
+    private String mrpaltcode;
     private Boolean standard;
     private double confidence;
 
@@ -61,6 +62,14 @@ public class OcrOptionDTO {
 
     public void setDescription(String description) {
         this.description = description;
+    }
+
+    public String getMrpaltcode() {
+        return mrpaltcode;
+    }
+
+    public void setMrpaltcode(String mrpaltcode) {
+        this.mrpaltcode = mrpaltcode;
     }
 
     public Boolean getStandard() {

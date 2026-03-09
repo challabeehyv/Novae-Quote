@@ -1,5 +1,6 @@
 package com.novae.ocr.dto;
 
+import com.fasterxml.jackson.annotation.JsonIgnore;
 import java.math.BigDecimal;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
@@ -17,6 +18,9 @@ public class OcrQuoteLineDTO {
     private String colorParam;
     private BigDecimal basePrice;
     private List<OcrOptionDTO> options = new ArrayList<>();
+    /** Raw OCR-extracted option strings. Stored in-memory for Phase 2 lookup; never serialized. */
+    @JsonIgnore
+    private List<String> rawOptions = new ArrayList<>();
     private Map<String, String> specs = new LinkedHashMap<>();
     private Double confidence;
     private List<String> rowFlags = new ArrayList<>();
@@ -68,6 +72,14 @@ public class OcrQuoteLineDTO {
 
     public void setOptions(List<OcrOptionDTO> options) {
         this.options = options != null ? options : new ArrayList<>();
+    }
+
+    public List<String> getRawOptions() {
+        return rawOptions;
+    }
+
+    public void setRawOptions(List<String> rawOptions) {
+        this.rawOptions = rawOptions != null ? rawOptions : new ArrayList<>();
     }
 
     public Double getConfidence() {

@@ -47,6 +47,8 @@ public final class OcrConstants {
     // API endpoints (MCP Client)
     public static final String MCP_CLIENT_EXTRACT = "/api/quote/extract";
     public static final String MCP_CLIENT_RESOLVE = "/api/quote/resolve";
+    /** Step 2: resolve options for a human-selected trailer modelId. */
+    public static final String MCP_CLIENT_TRAILER_RESOLVE_OPTIONS = "/api/quote/trailer/resolve-options";
 
     // Config keys
     public static final String CONFIG_MCP_CLIENT_BASE_URL = "mcp.client.base-url";

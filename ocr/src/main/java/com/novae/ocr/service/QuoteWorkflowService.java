@@ -1,7 +1,10 @@
 package com.novae.ocr.service;
 
+import com.novae.ocr.dto.OcrOptionDTO;
 import com.novae.ocr.dto.OcrQuoteDTO;
 import org.springframework.web.multipart.MultipartFile;
+
+import java.util.List;
 
 /**
  * Orchestrates PDF → OCR → Extract → Resolve → Validate → OcrQuoteDTO.
@@ -9,22 +12,15 @@ import org.springframework.web.multipart.MultipartFile;
 public interface QuoteWorkflowService {
 
     /**
-     * Process uploaded PDF through full pipeline; returns OcrQuoteDTO.
-     */
-    OcrQuoteDTO processPdf(MultipartFile file);
-
-    /**
-     * Process uploaded PDF through full pipeline using explicit auth header.
-     */
-    OcrQuoteDTO processPdf(MultipartFile file, String authorizationHeader);
-
-    /**
      * Process PDF bytes through full pipeline using explicit auth header.
      */
     OcrQuoteDTO processPdfBytes(byte[] fileBytes, String fileName, String authorizationHeader);
 
+
     /**
-     * Process PDF from file path (e.g. for testing or batch).
+     * Step 2 of the two-step trailer resolution flow.
+     * Given the modelId selected by the human and the original OCR options, resolves and returns
+     * the best-matching option details via LLM.
      */
-    OcrQuoteDTO processPdfByPath(String filePath);
+    List<OcrOptionDTO> resolveOptionsForSelectedModel(String modelId, List<String> options, String authorizationHeader);
 }

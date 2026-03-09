@@ -33,17 +33,6 @@ public class AzureOcrServiceImpl implements AzureOcrService {
         this.documentAnalysisClient = documentAnalysisClient;
     }
 
-    @Override
-    public String extractText(MultipartFile file) {
-        if (documentAnalysisClient == null) {
-            return "";
-        }
-        try {
-            return extractText(file.getInputStream(), file.getOriginalFilename());
-        } catch (IOException e) {
-            throw new OcrProcessingException(OcrConstants.ERROR_OCR_FAILED, e);
-        }
-    }
 
     @Override
     public String extractText(InputStream inputStream, @Nullable String fileName) {
@@ -61,21 +50,6 @@ public class AzureOcrServiceImpl implements AzureOcrService {
         }
     }
 
-    @Override
-    public List<String> extractTextByPages(InputStream inputStream, @Nullable String fileName) {
-        if (documentAnalysisClient == null) {
-            return List.of();
-        }
-        try {
-            return doExtractByPages(inputStream, fileName);
-        } catch (Exception e) {
-            log.warn("Azure OCR by-pages failed for file={}", fileName, e);
-            if (isUnknownHost(e)) {
-                throw new OcrProcessingException(OcrConstants.ERROR_OCR_DNS_FAILED, e);
-            }
-            throw new OcrProcessingException(OcrConstants.ERROR_OCR_FAILED, e);
-        }
-    }
 
     private String doExtract(InputStream inputStream, @Nullable String fileName) throws IOException {
         AnalyzeResult result = analyzeDocument(inputStream, fileName);
@@ -84,29 +58,6 @@ public class AzureOcrServiceImpl implements AzureOcrService {
         return content != null ? content : "";
     }
 
-    private List<String> doExtractByPages(InputStream inputStream, @Nullable String fileName) throws IOException {
-        AnalyzeResult result = analyzeDocument(inputStream, fileName);
-        if (result == null || result.getPages() == null) return List.of();
-        String content = result.getContent();
-        if (content == null) content = "";
-        List<String> pageTexts = new ArrayList<>();
-        for (DocumentPage page : result.getPages()) {
-            if (page.getSpans() == null || page.getSpans().isEmpty()) {
-                pageTexts.add("");
-                continue;
-            }
-            StringBuilder sb = new StringBuilder();
-            for (DocumentSpan span : page.getSpans()) {
-                int offset = span.getOffset();
-                int length = span.getLength();
-                if (offset >= 0 && offset + length <= content.length()) {
-                    sb.append(content, offset, offset + length);
-                }
-            }
-            pageTexts.add(sb.toString());
-        }
-        return pageTexts;
-    }
 
     private AnalyzeResult analyzeDocument(InputStream inputStream, @Nullable String fileName) throws IOException {
         byte[] bytes = readFully(inputStream);

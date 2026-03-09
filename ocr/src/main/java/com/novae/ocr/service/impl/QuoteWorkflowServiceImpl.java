@@ -1,52 +1,39 @@
 package com.novae.ocr.service.impl;
 
+import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.novae.ocr.constants.OcrConstants;
-import com.novae.ocr.dto.ExtractedLine;
-import com.novae.ocr.dto.ExtractedQuote;
-import com.novae.ocr.dto.OcrOptionDTO;
-import com.novae.ocr.dto.OcrQuoteDTO;
-import com.novae.ocr.dto.OcrQuoteLineDTO;
-import com.novae.ocr.dto.ProductSuggestion;
-import com.novae.ocr.dto.ResolvedLine;
-import com.novae.ocr.dto.ResolutionResult;
-import com.novae.ocr.dto.ValidationResult;
+import com.novae.ocr.dto.*;
 import com.novae.ocr.exception.OcrProcessingException;
 import com.novae.ocr.service.AzureOcrService;
 import com.novae.ocr.service.QuoteWorkflowService;
 import com.novae.ocr.service.ValidationService;
 import jakarta.annotation.PreDestroy;
-import org.springframework.beans.factory.annotation.Value;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Qualifier;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.http.MediaType;
 import org.springframework.stereotype.Service;
-import org.springframework.web.context.request.RequestContextHolder;
-import org.springframework.web.context.request.ServletRequestAttributes;
 import org.springframework.web.client.RestClient;
 import org.springframework.web.client.RestClientException;
-import org.springframework.web.multipart.MultipartFile;
-import org.springframework.http.MediaType;
+import org.springframework.web.context.request.RequestContextHolder;
+import org.springframework.web.context.request.ServletRequestAttributes;
 
 import java.io.ByteArrayInputStream;
-import java.util.ArrayList;
-import java.util.Collections;
-
-import java.util.LinkedHashSet;
-import java.util.LinkedHashMap;
-import java.util.List;
-import java.util.Locale;
-import java.util.Map;
+import java.util.*;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.CompletionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Semaphore;
-import java.util.regex.Pattern;
 import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 @Service
 public class QuoteWorkflowServiceImpl implements QuoteWorkflowService {
     private static final Logger log = LoggerFactory.getLogger(QuoteWorkflowServiceImpl.class);
+    private static final ObjectMapper MAPPER = new ObjectMapper();
+    private static final TypeReference<List<OcrOptionDTO>> OCR_OPTION_DTO_LIST = new TypeReference<>() {};
     private static final Pattern SIZE_PATTERN = Pattern.compile(
             "\\b\\d+\\s*[xX]\\s*\\d+(?:\\s*\\(\\s*\\d+\\s*\\+\\s*\\d+\\s*\\))?\\b");
     private static final Pattern SALES_CODE_PATTERN = Pattern.compile("^[A-Za-z0-9][A-Za-z0-9-]{2,}$");
@@ -80,17 +67,6 @@ public class QuoteWorkflowServiceImpl implements QuoteWorkflowService {
         resolveExecutor.shutdown();
     }
 
-    @Override
-    public OcrQuoteDTO processPdf(MultipartFile file) {
-        String ocrText = azureOcrService.extractText(file);
-        return processOcrText(ocrText, currentAuthorizationHeader());
-    }
-
-    @Override
-    public OcrQuoteDTO processPdf(MultipartFile file, String authorizationHeader) {
-        String ocrText = azureOcrService.extractText(file);
-        return processOcrText(ocrText, authorizationHeader);
-    }
 
     @Override
     public OcrQuoteDTO processPdfBytes(byte[] fileBytes, String fileName, String authorizationHeader) {
@@ -106,13 +82,29 @@ public class QuoteWorkflowServiceImpl implements QuoteWorkflowService {
     }
 
     @Override
-    public OcrQuoteDTO processPdfByPath(String filePath) {
-        try (var is = java.nio.file.Files.newInputStream(java.nio.file.Paths.get(filePath))) {
-            String ocrText = azureOcrService.extractText(is, filePath);
-            return processOcrText(ocrText, currentAuthorizationHeader());
+    public List<OcrOptionDTO> resolveOptionsForSelectedModel(String modelId, List<String> options, String authorizationHeader) {
+        try {
+            var request = mcpClientRestClient.post()
+                    .uri(OcrConstants.MCP_CLIENT_TRAILER_RESOLVE_OPTIONS)
+                    .contentType(MediaType.APPLICATION_JSON)
+                    .accept(MediaType.APPLICATION_JSON);
+            if (authorizationHeader != null && !authorizationHeader.isBlank()) {
+                request = request.header("Authorization", authorizationHeader);
+            }
+            Map<String, Object> body = new LinkedHashMap<>();
+            body.put("modelId", modelId);
+            body.put("options", options != null ? options : List.of());
+            String responseBody = request.body(body).retrieve().body(String.class);
+            if (responseBody == null || responseBody.isBlank()) {
+                return List.of();
+            }
+            List<OcrOptionDTO> result = MAPPER.readValue(responseBody, OCR_OPTION_DTO_LIST);
+            return result != null ? result : List.of();
+        } catch (RestClientException e) {
+            throw toMcpException(OcrConstants.ERROR_RESOLUTION_FAILED, OcrConstants.MCP_CLIENT_TRAILER_RESOLVE_OPTIONS, e);
         } catch (Exception e) {
-            throw new com.novae.ocr.exception.OcrProcessingException(
-                    OcrConstants.ERROR_OCR_FAILED, e);
+            log.warn("Failed to resolve options for modelId={}: {}", modelId, e.getMessage());
+            return List.of();
         }
     }
 
@@ -180,53 +172,7 @@ public class QuoteWorkflowServiceImpl implements QuoteWorkflowService {
         return result;
     }
 
-    private List<ResolutionResult> resolveWave(List<ExtractedQuote> wave, String authorization, int startBatchIndex) {
-        List<CompletableFuture<ResolutionResult>> futures = new ArrayList<>();
-        for (int i = 0; i < wave.size(); i++) {
-            ExtractedQuote batch = wave.get(i);
-            final int batchIndex = startBatchIndex + i + 1;
-            futures.add(CompletableFuture.supplyAsync(
-                    () -> resolveBatchWithTiming(batch, authorization, batchIndex), resolveExecutor));
-        }
-        try {
-            CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).join();
-        } catch (CompletionException e) {
-            Throwable cause = e.getCause();
-            if (cause instanceof RuntimeException runtimeException) {
-                throw runtimeException;
-            }
-            throw new OcrProcessingException(OcrConstants.ERROR_RESOLUTION_FAILED, e);
-        }
-        return futures.stream().map(CompletableFuture::join).toList();
-    }
 
-    private ResolutionResult resolveBatchWithTiming(ExtractedQuote batch, String authorization, int batchIndex) {
-        int lineCount = batch.getLines() != null ? batch.getLines().size() : 0;
-        long startNs = System.nanoTime();
-        log.info("Resolve batch {} started (lines={})", batchIndex, lineCount);
-        try {
-            ResolutionResult result = resolveQuoteWithoutRetry(batch, authorization);
-            long elapsedMs = (System.nanoTime() - startNs) / 1_000_000;
-            log.info("Resolve batch {} succeeded in {} ms", batchIndex, elapsedMs);
-            return result;
-        } catch (RuntimeException ex) {
-            long elapsedMs = (System.nanoTime() - startNs) / 1_000_000;
-            log.warn("Resolve batch {} failed after {} ms", batchIndex, elapsedMs, ex);
-            throw ex;
-        }
-    }
-
-    private ResolutionResult resolveBatchesSequentially(List<ExtractedQuote> batches, String authorization) {
-        List<ResolutionResult> partials = new ArrayList<>();
-        for (ExtractedQuote batch : batches) {
-            partials.add(resolveQuoteWithRetry(batch, authorization));
-        }
-        return mergeResolutionResults(partials, batches.stream()
-                .map(ExtractedQuote::getLines)
-                .filter(java.util.Objects::nonNull)
-                .mapToInt(List::size)
-                .sum());
-    }
 
     private ResolutionResult resolveQuoteWithRetry(ExtractedQuote extracted, String authorization) {
         try {
@@ -244,82 +190,6 @@ public class QuoteWorkflowServiceImpl implements QuoteWorkflowService {
         }
     }
 
-    private ResolutionResult resolveQuoteWithoutRetry(ExtractedQuote extracted, String authorization) {
-        try {
-            return executeResolveQuote(extracted, authorization);
-        } catch (RestClientException exception) {
-            throw toMcpException(OcrConstants.ERROR_RESOLUTION_FAILED, OcrConstants.MCP_CLIENT_RESOLVE, exception);
-        }
-    }
-
-    private static List<ExtractedQuote> partitionExtractedQuote(ExtractedQuote extracted, int batchSize) {
-        List<ExtractedLine> lines = extracted.getLines() != null ? extracted.getLines() : Collections.emptyList();
-        List<ExtractedQuote> batches = new ArrayList<>();
-        for (int i = 0; i < lines.size(); i += batchSize) {
-            int end = Math.min(lines.size(), i + batchSize);
-            ExtractedQuote batch = new ExtractedQuote();
-            batch.setPoNumber(extracted.getPoNumber());
-            batch.setVendorName(extracted.getVendorName());
-            batch.setSubtotal(extracted.getSubtotal());
-            batch.setTax(extracted.getTax());
-            batch.setTotal(extracted.getTotal());
-            batch.setDocumentType(extracted.getDocumentType());
-            batch.setLines(new ArrayList<>(lines.subList(i, end)));
-            batches.add(batch);
-        }
-        return batches;
-    }
-
-    private static ResolutionResult mergeResolutionResults(List<ResolutionResult> partials, int totalLines) {
-        ResolutionResult merged = new ResolutionResult();
-        List<ResolvedLine> mergedLines = new ArrayList<>();
-        List<String> warnings = new ArrayList<>();
-        List<String> missingFields = new ArrayList<>();
-        String vendorId = null;
-        double confidenceTotal = 0.0;
-        int confidenceWeight = 0;
-
-        for (ResolutionResult partial : partials) {
-            if (partial == null) {
-                continue;
-            }
-            List<ResolvedLine> lines = partial.getLines() != null ? partial.getLines() : Collections.emptyList();
-            mergedLines.addAll(lines);
-            int weight = lines.size();
-            confidenceTotal += partial.getOverallConfidence() * weight;
-            confidenceWeight += weight;
-            if (vendorId == null && partial.getResolvedVendorId() != null && !partial.getResolvedVendorId().isBlank()) {
-                vendorId = partial.getResolvedVendorId();
-            }
-            if (partial.getWarnings() != null) {
-                for (String warning : partial.getWarnings()) {
-                    if (warning != null && !warnings.contains(warning)) {
-                        warnings.add(warning);
-                    }
-                }
-            }
-            if (partial.getMissingFields() != null) {
-                for (String field : partial.getMissingFields()) {
-                    if (field != null && !missingFields.contains(field)) {
-                        missingFields.add(field);
-                    }
-                }
-            }
-        }
-
-        merged.setLines(mergedLines);
-        merged.setResolvedVendorId(vendorId);
-        if (confidenceWeight > 0) {
-            merged.setOverallConfidence(confidenceTotal / confidenceWeight);
-        } else if (totalLines > 0) {
-            merged.setOverallConfidence(confidenceTotal / totalLines);
-        } else {
-            merged.setOverallConfidence(0.0);
-        }
-        merged.setWarnings(warnings);
-        merged.setMissingFields(missingFields);
-        return merged;
-    }
 
     private ResolutionResult executeResolveQuote(ExtractedQuote extracted, String authorization) {
         long waitStartNs = System.nanoTime();
@@ -406,6 +276,7 @@ public class QuoteWorkflowServiceImpl implements QuoteWorkflowService {
         LineDetails details = resolveLineDetails(res, ext);
         line.setOptions(details.options());
         line.setSpecs(details.specs());
+        line.setRawOptions(mergeRawOptions(res, ext));
         line.setConfidence(resolveLineConfidence(ext, res));
         List<String> rowFlags = new ArrayList<>();
         if (res != null && res.getRowFlags() != null) rowFlags.addAll(res.getRowFlags());
@@ -645,25 +516,6 @@ public class QuoteWorkflowServiceImpl implements QuoteWorkflowService {
 
     private static String normalize(String s) {
         return s == null ? "" : s.trim().toLowerCase(Locale.ROOT);
-    }
-
-    private static boolean looksLikeSalesCode(String value) {
-        if (isBlank(value)) return false;
-        String s = value.trim();
-        if (s.contains(" ")) return false;
-        if (!SALES_CODE_PATTERN.matcher(s).matches()) return false;
-        for (int i = 0; i < s.length(); i++) {
-            if (Character.isDigit(s.charAt(i))) return true;
-        }
-        return false;
-    }
-
-    private static String normalizeToken(String token) {
-        return token == null ? "" : token.replaceAll("[^A-Za-z0-9]", "").toLowerCase(Locale.ROOT);
-    }
-
-    private static String collapseWhitespace(String text) {
-        return text == null ? null : text.replaceAll("\\s+", " ").trim();
     }
 
     private static boolean isBlank(String s) {
